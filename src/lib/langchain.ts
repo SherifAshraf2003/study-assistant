@@ -1,4 +1,4 @@
-import { ConversationalRetrievalQAChain } from "langchain/chains";
+import { ConversationalRetrievalQAChain, LLMChain } from "langchain/chains";
 import { getVectorStore } from "./vector-store";
 import { getPineconeClient } from "./pinecone-client";
 import {
@@ -7,7 +7,12 @@ import {
   LangChainStream,
 } from "ai";
 import { streamingMistralModel, nonStreamingMistralModel } from "./llmMistral";
-import { STANDALONE_QUESTION_TEMPLATE, QA_TEMPLATE } from "./prompt-templates";
+import { PromptTemplate } from "@langchain/core/prompts";
+import {
+  STANDALONE_QUESTION_TEMPLATE,
+  QUESTION_GENERATION_TEMPLATE,
+  DISCUSSION_TEMPLATE
+} from "./prompt-templates";
 
 type callChainArgs = {
   question: string;
@@ -25,11 +30,28 @@ export async function callChain({ question, chatHistory }: callChainArgs) {
     });
     const data = new experimental_StreamData();
 
+    // Create question generation chain
+    const questionGenerationChain = new LLMChain({
+      llm: nonStreamingMistralModel,
+      prompt: new PromptTemplate({
+        template: QUESTION_GENERATION_TEMPLATE,
+        inputVariables: ["context"],
+      }),
+    });
+
+    // Create discussion chain
+    const discussionChain = new LLMChain({
+      llm: streamingMistralModel,
+      prompt: new PromptTemplate({
+        template: DISCUSSION_TEMPLATE,
+        inputVariables: ["context", "question", "human_answer"],
+      }),
+    });
+
     const chain = ConversationalRetrievalQAChain.fromLLM(
       streamingMistralModel,
       vectorStore.asRetriever(),
       {
-        qaTemplate: QA_TEMPLATE,
         questionGeneratorTemplate: STANDALONE_QUESTION_TEMPLATE,
         returnSourceDocuments: true, //default 4
         questionGeneratorChainOptions: {
@@ -38,28 +60,57 @@ export async function callChain({ question, chatHistory }: callChainArgs) {
       }
     );
 
-    // Question using chat-history
-    // Reference https://js.langchain.com/docs/modules/chains/popular/chat_vector_db#externally-managed-memory
-    chain
-      .call(
+    // Determine if this is the start of the conversation
+    const isFirstMessage = chatHistory.trim() === "";
+
+    if (isFirstMessage) {
+      // Generate an initial question
+      const context = await vectorStore.similaritySearch("", 1);
+      const { text: generatedQuestion } = await questionGenerationChain.call({
+        context: context[0].pageContent,
+      });
+      
+      // Use the generated question as the first response
+      handlers.handleLLMNewToken(generatedQuestion);
+      
+      // Then proceed with the main chain using this generated question
+      chain.call(
         {
-          question: sanitizedQuestion,
+          question: generatedQuestion,
           chat_history: chatHistory,
         },
         [handlers]
-      )
-      .then(async (res) => {
+      ).then(async (res) => {
         const sourceDocuments = res?.sourceDocuments;
         const firstTwoDocuments = sourceDocuments.slice(0, 2);
         const pageContents = firstTwoDocuments.map(
           ({ pageContent }: { pageContent: string }) => pageContent
         );
-        console.log("already appended ", data);
         data.append({
           sources: pageContents,
         });
         data.close();
       });
+    } else {
+      // For subsequent messages, use the main chain as before
+      chain.call(
+        {
+          question: sanitizedQuestion,
+          chat_history: chatHistory,
+        },
+        [handlers]
+      ).then(async (res) => {
+        const sourceDocuments = res?.sourceDocuments;
+        const firstTwoDocuments = sourceDocuments.slice(0, 2);
+        const pageContents = firstTwoDocuments.map(
+          ({ pageContent }: { pageContent: string }) => pageContent
+        );
+        data.append({
+          sources: pageContents,
+        });
+        data.close();
+      });
+    }
 
     // Return the readable stream
     return new StreamingTextResponse(stream, {}, data);
